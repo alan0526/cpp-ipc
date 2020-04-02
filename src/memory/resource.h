@@ -17,9 +17,12 @@
 namespace ipc {
 namespace mem {
 
-template <std::size_t Size>
-using static_async_fixed = static_wrapper<async_wrapper<fixed_alloc<Size>>>;
-using async_pool_alloc   = variable_wrapper<static_async_fixed>;
+using async_pool_alloc = static_wrapper<variable_wrapper<async_wrapper<
+    detail::fixed_alloc<
+        variable_alloc                           <sizeof(void*) * 1024 * 256>, 
+        fixed_expand_policy<sizeof(void*) * 1024, sizeof(void*) * 1024 * 256>
+    >, 
+    default_recycler >>>;
 
 template <typename T>
 using allocator = allocator_wrapper<T, async_pool_alloc>;

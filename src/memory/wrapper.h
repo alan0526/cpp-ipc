@@ -1,18 +1,19 @@
 #pragma once
 
-#include <limits>
-#include <new>
 #include <tuple>
 #include <thread>
-#include <vector>
-#include <functional>
-#include <utility>
+#include <set>          // std::set
+#include <functional>   // std::function
+#include <utility>      // std::forward
 #include <cstddef>
-#include <type_traits>
+#include <cassert>      // assert
+#include <type_traits>  // std::aligned_storage_t
+#include <new>          // ::new
 
 #include "def.h"
 #include "rw_lock.h"
 #include "tls_pointer.h"
+#include "concept.h"
 
 #include "memory/alloc.h"
 #include "platform/detail.h"
@@ -21,170 +22,285 @@ namespace ipc {
 namespace mem {
 
 ////////////////////////////////////////////////////////////////
-/// The allocator wrapper class for STL
-////////////////////////////////////////////////////////////////
-
-template <typename T, typename AllocP>
-class allocator_wrapper {
-
-    template <typename U, typename AllocU>
-    friend class allocator_wrapper;
-
-public:
-    // type definitions
-    typedef T                 value_type;
-    typedef value_type*       pointer;
-    typedef const value_type* const_pointer;
-    typedef value_type&       reference;
-    typedef const value_type& const_reference;
-    typedef std::size_t       size_type;
-    typedef std::ptrdiff_t    difference_type;
-    typedef AllocP            alloc_policy;
-
-private:
-    alloc_policy alloc_;
-
-public:
-    allocator_wrapper(void) noexcept = default;
-
-    allocator_wrapper(const allocator_wrapper<T, AllocP>& rhs) noexcept
-        : alloc_(rhs.alloc_)
-    {}
-
-    template <typename U>
-    allocator_wrapper(const allocator_wrapper<U, AllocP>& rhs) noexcept
-        : alloc_(rhs.alloc_)
-    {}
-
-    allocator_wrapper(allocator_wrapper<T, AllocP>&& rhs) noexcept
-        : alloc_(std::move(rhs.alloc_))
-    {}
-
-    template <typename U>
-    allocator_wrapper(allocator_wrapper<U, AllocP>&& rhs) noexcept
-        : alloc_(std::move(rhs.alloc_))
-    {}
-
-    allocator_wrapper(const AllocP& rhs) noexcept
-        : alloc_(rhs)
-    {}
-
-    allocator_wrapper(AllocP&& rhs) noexcept
-        : alloc_(std::move(rhs))
-    {}
-
-public:
-    // the other type of std_allocator
-    template <typename U>
-    struct rebind { typedef allocator_wrapper<U, AllocP> other; };
-
-    constexpr size_type max_size(void) const noexcept {
-        return (std::numeric_limits<size_type>::max)() / sizeof(T);
-    }
-
-public:
-    pointer allocate(size_type count) noexcept {
-        if (count == 0) return nullptr;
-        if (count > this->max_size()) return nullptr;
-        return static_cast<pointer>(alloc_.alloc(count * sizeof(T)));
-    }
-
-    void deallocate(pointer p, size_type count) noexcept {
-        alloc_.free(p, count * sizeof(T));
-    }
-
-    template <typename... P>
-    static void construct(pointer p, P&&... params) {
-        ::new (static_cast<void*>(p)) T(std::forward<P>(params)...);
-    }
-
-    static void destroy(pointer p) {
-        p->~T();
-    }
-};
-
-template <class AllocP>
-class allocator_wrapper<void, AllocP> {
-public:
-    // type definitions
-    typedef void              value_type;
-    typedef value_type*       pointer;
-    typedef const value_type* const_pointer;
-    typedef std::size_t       size_type;
-    typedef std::ptrdiff_t    difference_type;
-    typedef AllocP            alloc_policy;
-};
-
-template <typename T, typename U, class AllocP>
-constexpr bool operator==(const allocator_wrapper<T, AllocP>&, const allocator_wrapper<U, AllocP>&) noexcept {
-    return true;
-}
-
-template <typename T, typename U, class AllocP>
-constexpr bool operator!=(const allocator_wrapper<T, AllocP>&, const allocator_wrapper<U, AllocP>&) noexcept {
-    return false;
-}
-
-////////////////////////////////////////////////////////////////
 /// Thread-safe allocation wrapper
 ////////////////////////////////////////////////////////////////
 
+namespace detail {
+
+IPC_CONCEPT_(is_comparable, operator<(std::declval<Type>()));
+
+} // namespace detail
+
+template <typename AllocP, bool = detail::is_comparable<AllocP>::value>
+class limited_recycler;
+
 template <typename AllocP>
+class limited_recycler<AllocP, true> {
+public:
+    using alloc_policy = AllocP;
+
+protected:
+    template <typename T>
+    struct fixed_alloc_t : public fixed_alloc<sizeof(T)> {};
+
+    template <typename T>
+    using allocator = ipc::mem::allocator_wrapper<T, fixed_alloc_t<T>>;
+
+    std::multiset<alloc_policy, std::less<alloc_policy>, 
+                  allocator<alloc_policy>
+    > master_allocs_;
+
+    ipc::spin_lock master_lock_;
+
+    template <typename F>
+    void take_first_do(F && pred) {
+        auto it = master_allocs_.begin();
+        pred(const_cast<alloc_policy&>(*it));
+        master_allocs_.erase(it);
+    }
+
+public:
+    void swap(limited_recycler & rhs) {
+        IPC_UNUSED_ auto guard = ipc::detail::unique_lock(master_lock_);
+        master_allocs_.swap(rhs.master_allocs_);
+    }
+
+    void try_recover(alloc_policy & alc) {
+        IPC_UNUSED_ auto guard = ipc::detail::unique_lock(master_lock_);
+        if (master_allocs_.empty()) return;
+        take_first_do([&alc](alloc_policy & first) { alc.swap(first); });
+    }
+
+    void collect(alloc_policy && alc) {
+        IPC_UNUSED_ auto guard = ipc::detail::unique_lock(master_lock_);
+        if (master_allocs_.size() >= 32) {
+            take_first_do([](alloc_policy &) {}); // erase first
+        }
+        master_allocs_.emplace(std::move(alc));
+    }
+
+    IPC_CONSTEXPR_ auto try_replenish(alloc_policy&, std::size_t) noexcept {}
+};
+
+template <typename AllocP>
+class default_recycler : public limited_recycler<AllocP> {
+
+    IPC_CONCEPT_(has_remain, remain());
+    IPC_CONCEPT_(has_empty , empty());
+
+    template <typename A>
+    void try_fill(A & alc) {
+        IPC_UNUSED_ auto guard = ipc::detail::unique_lock(this->master_lock_);
+        if (this->master_allocs_.empty()) return;
+        this->take_first_do([&alc](alloc_policy & first) { alc.take(std::move(first)); });
+    }
+
+public:
+    using alloc_policy = typename limited_recycler<AllocP>::alloc_policy;
+
+    template <typename A = AllocP>
+    auto try_replenish(alloc_policy & alc, std::size_t size)
+        -> ipc::require<detail::has_take<A>::value && has_remain<A>::value> {
+        if (alc.remain() >= size) return;
+        this->try_fill(alc);
+    }
+
+    template <typename A = AllocP>
+    auto try_replenish(alloc_policy & alc, std::size_t /*size*/)
+        -> ipc::require<detail::has_take<A>::value && !has_remain<A>::value && has_empty<A>::value> {
+        if (!alc.empty()) return;
+        this->try_fill(alc);
+    }
+
+    template <typename A = AllocP>
+    auto try_replenish(alloc_policy & alc, std::size_t /*size*/)
+        -> ipc::require<!detail::has_take<A>::value && has_empty<A>::value> {
+        if (!alc.empty()) return;
+        this->try_recover(alc);
+    }
+
+    template <typename A = AllocP>
+    IPC_CONSTEXPR_ auto try_replenish(alloc_policy & /*alc*/, std::size_t /*size*/) noexcept
+        -> ipc::require<(!detail::has_take<A>::value || !has_remain<A>::value) && !has_empty<A>::value> {
+        // Do Nothing.
+    }
+};
+
+template <typename AllocP>
+class empty_recycler {
+public:
+    using alloc_policy = AllocP;
+
+    IPC_CONSTEXPR_ void swap(empty_recycler&)                     noexcept {}
+    IPC_CONSTEXPR_ void try_recover(alloc_policy&)                noexcept {}
+    IPC_CONSTEXPR_ auto try_replenish(alloc_policy&, std::size_t) noexcept {}
+    IPC_CONSTEXPR_ void collect(alloc_policy&&)                   noexcept {}
+};
+
+template <typename AllocP,
+          template <typename> class RecyclerP = default_recycler>
 class async_wrapper {
 public:
     using alloc_policy = AllocP;
 
 private:
-    spin_lock master_lock_;
-    std::vector<alloc_policy> master_allocs_;
+    RecyclerP<alloc_policy> recycler_;
 
     class alloc_proxy : public AllocP {
         async_wrapper * w_ = nullptr;
 
     public:
-        alloc_proxy(alloc_proxy&& rhs)
-            : AllocP(std::move(rhs))
-        {}
+        alloc_proxy(alloc_proxy && rhs) = default;
 
-        alloc_proxy(async_wrapper* w) : w_(w) {
-            if (w_ == nullptr) return;
-            IPC_UNUSED_ auto guard = ipc::detail::unique_lock(w_->master_lock_);
-            if (!w_->master_allocs_.empty()) {
-                AllocP::swap(w_->master_allocs_.back());
-                w_->master_allocs_.pop_back();
-            }
+        template <typename ... P>
+        alloc_proxy(async_wrapper* w, P && ... pars)
+            : AllocP(std::forward<P>(pars) ...), w_(w) {
+            assert(w_ != nullptr);
+            w_->recycler_.try_recover(*this);
         }
 
         ~alloc_proxy() {
-            if (w_ == nullptr) return;
-            IPC_UNUSED_ auto guard = ipc::detail::unique_lock(w_->master_lock_);
-            w_->master_allocs_.emplace_back(std::move(*this));
+            w_->recycler_.collect(std::move(*this));
+        }
+
+        auto alloc(std::size_t size) {
+            w_->recycler_.try_replenish(*this, size);
+            return AllocP::alloc(size);
         }
     };
 
     friend class alloc_proxy;
 
-    auto& get_alloc() {
-        static tls::pointer<alloc_proxy> tls_alc;
-        return *tls_alc.create(this);
-    }
+    using ref_t = alloc_proxy&;
+    using tls_t = tls::pointer<alloc_proxy>;
+
+    tls_t tls_;
+    std::function<ref_t()> get_alloc_;
 
 public:
-    ~async_wrapper() {
-        clear();
-    }
-
-    void clear() {
-        IPC_UNUSED_ auto guard = ipc::detail::unique_lock(master_lock_);
-        master_allocs_.clear();
+    template <typename ... P>
+    async_wrapper(P ... pars) {
+        get_alloc_ = [this, pars ...]()->ref_t {
+            return *tls_.create(this, pars ...);
+        };
     }
 
     void* alloc(std::size_t size) {
-        return get_alloc().alloc(size);
+        return get_alloc_().alloc(size);
     }
 
     void free(void* p, std::size_t size) {
-        get_alloc().free(p, size);
+        get_alloc_().free(p, size);
+    }
+};
+
+////////////////////////////////////////////////////////////////
+/// Thread-safe allocation wrapper (with spin_lock)
+////////////////////////////////////////////////////////////////
+
+template <typename AllocP, typename MutexT = ipc::spin_lock>
+class sync_wrapper {
+public:
+    using alloc_policy = AllocP;
+    using mutex_type   = MutexT;
+
+private:
+    mutex_type   lock_;
+    alloc_policy alloc_;
+
+public:
+    template <typename ... P>
+    sync_wrapper(P && ... pars)
+        : alloc_(std::forward<P>(pars) ...)
+    {}
+
+    void swap(sync_wrapper& rhs) {
+        IPC_UNUSED_ auto guard = ipc::detail::unique_lock(lock_);
+        alloc_.swap(rhs.alloc_);
+    }
+
+    void* alloc(std::size_t size) {
+        IPC_UNUSED_ auto guard = ipc::detail::unique_lock(lock_);
+        return alloc_.alloc(size);
+    }
+
+    void free(void* p, std::size_t size) {
+        IPC_UNUSED_ auto guard = ipc::detail::unique_lock(lock_);
+        alloc_.free(p, size);
+    }
+};
+
+////////////////////////////////////////////////////////////////
+/// Variable memory allocation wrapper
+////////////////////////////////////////////////////////////////
+
+template <std::size_t BaseSize = 0, std::size_t IterSize = sizeof(void*)>
+struct default_mapping_policy {
+
+    enum : std::size_t {
+        base_size    = BaseSize,
+        iter_size    = IterSize,
+        classes_size = 64
+    };
+
+    template <typename F, typename ... P>
+    IPC_CONSTEXPR_ static void foreach(F f, P ... params) {
+        for (std::size_t i = 0; i < classes_size; ++i) f(i, params...);
+    }
+
+    IPC_CONSTEXPR_ static std::size_t block_size(std::size_t id) noexcept {
+        return (id < classes_size) ? (base_size + (id + 1) * iter_size) : 0;
+    }
+
+    template <typename F, typename D, typename ... P>
+    IPC_CONSTEXPR_ static auto classify(F f, D d, std::size_t size, P ... params) {
+        std::size_t id = (size - base_size - 1) / iter_size;
+        return (id < classes_size) ? f(id, size, params...) : d(size, params...);
+    }
+};
+
+template <typename FixedAlloc,
+          typename DefaultAlloc = mem::static_alloc,
+          typename MappingP     = default_mapping_policy<>>
+class variable_wrapper {
+
+    struct initiator {
+
+        std::aligned_storage_t< sizeof(FixedAlloc), 
+                               alignof(FixedAlloc)> arr_[MappingP::classes_size];
+
+        initiator() {
+            MappingP::foreach([](std::size_t id, initiator* t) {
+                ::new (&(t->arr_[id])) FixedAlloc(MappingP::block_size(id));
+            }, this);
+        }
+
+        FixedAlloc& at(std::size_t id) {
+            return reinterpret_cast<FixedAlloc&>(arr_[id]);
+        }
+    } init_;
+
+public:
+    void swap(variable_wrapper & other) {
+        MappingP::foreach([](std::size_t id, initiator* t, initiator* o) {
+            t->at(id).swap(o->at(id));
+        }, &init_, &other.init_);
+    }
+
+    void* alloc(std::size_t size) {
+        return MappingP::classify([](std::size_t id, std::size_t size, initiator* t) {
+            return t->at(id).alloc(size);
+        }, [](std::size_t size, initiator*) {
+            return DefaultAlloc::alloc(size);
+        }, size, &init_);
+    }
+
+    void free(void* p, std::size_t size) {
+        MappingP::classify([](std::size_t id, std::size_t size, void* p, initiator* t) {
+            t->at(id).free(p, size);
+        }, [](std::size_t size, void* p, initiator*) {
+            DefaultAlloc::free(p, size);
+        }, size, p, &init_);
     }
 };
 
@@ -202,9 +318,7 @@ public:
         return alloc;
     }
 
-    static void clear() {
-        instance().clear();
-    }
+    static void swap(static_wrapper&) {}
 
     static void* alloc(std::size_t size) {
         return instance().alloc(size);
@@ -212,66 +326,6 @@ public:
 
     static void free(void* p, std::size_t size) {
         instance().free(p, size);
-    }
-};
-
-////////////////////////////////////////////////////////////////
-/// Variable memory allocation wrapper
-////////////////////////////////////////////////////////////////
-
-template <std::size_t BaseSize = sizeof(void*)>
-struct default_mapping_policy {
-
-    enum : std::size_t {
-        base_size    = BaseSize,
-        classes_size = 32
-    };
-
-    static const std::size_t table[classes_size];
-
-    constexpr static std::size_t classify(std::size_t size) {
-        return (((size - 1) / base_size) < classes_size) ?
-            // always uses default_mapping_policy<sizeof(void*)>::table
-            default_mapping_policy<>::table[((size - 1) / base_size)] : classes_size;
-    }
-};
-
-template <std::size_t B>
-const std::size_t default_mapping_policy<B>::table[default_mapping_policy<B>::classes_size] = {
-    /* 1 - 8 ~ 32 */
-    0 , 1 , 2 , 3 ,
-    /* 2 - 48 ~ 256 */
-    5 , 5 , 7 , 7 , 9 , 9 , 11, 11, 13, 13, 15, 15, 17, 17,
-    19, 19, 21, 21, 23, 23, 25, 25, 27, 27, 29, 29, 31, 31
-};
-
-template <template <std::size_t> class Fixed,
-          typename StaticAlloc = mem::static_alloc,
-          typename MappingP    = default_mapping_policy<>>
-class variable_wrapper {
-
-    template <typename F>
-    constexpr static auto choose(std::size_t size, F&& f) {
-        return ipc::detail::static_switch<MappingP::classes_size>(MappingP::classify(size), [&f](auto index) {
-            return f(Fixed<(decltype(index)::value + 1) * MappingP::base_size>{});
-        }, [&f] {
-            return f(StaticAlloc{});
-        });
-    }
-
-public:
-    static void clear() {
-        ipc::detail::static_for<MappingP::classes_size>([](auto index) {
-            Fixed<(decltype(index)::value + 1) * MappingP::base_size>::clear();
-        });
-    }
-
-    static void* alloc(std::size_t size) {
-        return choose(size, [size](auto&& alc) { return alc.alloc(size); });
-    }
-
-    static void free(void* p, std::size_t size) {
-        choose(size, [p, size](auto&& alc) { alc.free(p, size); });
     }
 };
 

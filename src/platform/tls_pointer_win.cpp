@@ -1,7 +1,8 @@
 #include "tls_pointer.h"
+#include "log.h"
 
 #include <Windows.h>     // ::Tls...
-#include <unordered_map> // std::unordered_map
+#include <atomic>
 
 namespace ipc {
 
@@ -23,92 +24,182 @@ namespace {
 
 struct tls_data {
     using destructor_t = void(*)(void*);
-    using map_t = std::unordered_map<tls::key_t, tls_data>;
 
-    static DWORD& key() {
-        static DWORD rec_key = ::TlsAlloc();
-        return rec_key;
+    unsigned     index_;
+    DWORD        win_key_;
+    destructor_t destructor_;
+
+    bool valid() const noexcept {
+        return win_key_ != TLS_OUT_OF_INDEXES;
     }
 
-    static map_t* records(map_t* rec) {
-        ::TlsSetValue(key(), static_cast<LPVOID>(rec));
-        return rec;
+    void* get() const {
+        return ::TlsGetValue(win_key_);
     }
 
-    static map_t* records() {
-        return static_cast<map_t*>(::TlsGetValue(key()));
+    bool set(void* p) {
+        return TRUE == ::TlsSetValue(win_key_, static_cast<LPVOID>(p));
     }
 
-    tls::key_t   key_        = tls::invalid_value;
-    destructor_t destructor_ = nullptr;
-
-    tls_data() = default;
-
-    tls_data(tls::key_t key, destructor_t destructor)
-        : key_       (key)
-        , destructor_(destructor)
-    {}
-
-    tls_data(tls_data&& rhs) : tls_data() {
-        (*this) = std::move(rhs);
+    void destruct() {
+        void* data = valid() ? get() : nullptr;
+        if (data != nullptr) {
+            if (destructor_ != nullptr) destructor_(data);
+            set(nullptr);
+        }
     }
 
-    tls_data& operator=(tls_data&& rhs) {
-        key_            = rhs.key_;
-        destructor_     = rhs.destructor_;
-        rhs.key_        = 0;
-        rhs.destructor_ = nullptr;
-        return *this;
-    }
-
-    ~tls_data() {
-        if (destructor_) destructor_(tls::get(key_));
+    void clear_self() {
+        if (valid()) {
+            destruct();
+            ::TlsFree(win_key_);
+        }
+        delete this;
     }
 };
+
+struct tls_recs {
+    tls_data* recs_[TLS_MINIMUM_AVAILABLE] {};
+    unsigned index_ = 0;
+
+    bool insert(tls_data* data) noexcept {
+        if (index_ >= TLS_MINIMUM_AVAILABLE) {
+            ipc::error("[tls_recs] insert tls_data failed[index_ >= TLS_MINIMUM_AVAILABLE].\n");
+            return false;
+        }
+        recs_[(data->index_ = index_++)] = data;
+        return true;
+    }
+
+    bool erase(tls_data* data) noexcept {
+        if (data->index_ >= TLS_MINIMUM_AVAILABLE) return false;
+        recs_[data->index_] = nullptr;
+        return true;
+    }
+
+    tls_data*       * begin()       noexcept { return &recs_[0]; }
+    tls_data* const * begin() const noexcept { return &recs_[0]; }
+    tls_data*       * end  ()       noexcept { return &recs_[index_]; }
+    tls_data* const * end  () const noexcept { return &recs_[index_]; }
+};
+
+struct key_gen {
+    DWORD rec_key_;
+
+    key_gen() : rec_key_(::TlsAlloc()) {
+        if (rec_key_ == TLS_OUT_OF_INDEXES) {
+            ipc::error("[record_key] TlsAlloc failed[%lu].\n", ::GetLastError());
+        }
+    }
+
+    ~key_gen() { 
+        ::TlsFree(rec_key_);
+        rec_key_ = TLS_OUT_OF_INDEXES;
+    }
+} gen__;
+
+DWORD& record_key() noexcept {
+    return gen__.rec_key_;
+}
+
+bool record(tls_data* tls_dat) {
+    if (record_key() == TLS_OUT_OF_INDEXES) return false;
+    auto rec = static_cast<tls_recs*>(::TlsGetValue(record_key()));
+    if (rec == nullptr) {
+        if (FALSE == ::TlsSetValue(record_key(), static_cast<LPVOID>(rec = new tls_recs))) {
+            ipc::error("[record] TlsSetValue failed[%lu].\n", ::GetLastError());
+            return false;
+        }
+    }
+    return rec->insert(tls_dat);
+}
+
+void erase_record(tls_data* tls_dat) {
+    if (tls_dat == nullptr) return;
+    if (record_key() == TLS_OUT_OF_INDEXES) return;
+    auto rec = static_cast<tls_recs*>(::TlsGetValue(record_key()));
+    if (rec == nullptr) return;
+    rec->erase(tls_dat);
+    tls_dat->clear_self();
+}
+
+void clear_all_records() {
+    if (record_key() == TLS_OUT_OF_INDEXES) return;
+    auto rec = static_cast<tls_recs*>(::TlsGetValue(record_key()));
+    if (rec == nullptr) return;
+    for (auto tls_dat : *rec) {
+        if (tls_dat != nullptr) tls_dat->destruct();
+    }
+    delete rec;
+    ::TlsSetValue(record_key(), static_cast<LPVOID>(nullptr));
+}
 
 } // internal-linkage
 
 namespace tls {
 
 key_t create(destructor_t destructor) {
-    key_t key = static_cast<key_t>(::TlsAlloc());
-    if (key == TLS_OUT_OF_INDEXES) return invalid_value;
-    auto rec = tls_data::records();
-    if (rec == nullptr) rec = tls_data::records(new tls_data::map_t);
-    if (rec == nullptr) return key;
-    rec->emplace(key, tls_data{ key, destructor });
-    return key;
+    record_key(); // gen record-key
+    auto tls_dat = new tls_data { unsigned(-1), ::TlsAlloc(), destructor };
+    std::atomic_thread_fence(std::memory_order_seq_cst);
+    if (!tls_dat->valid()) {
+        ipc::error("[tls::create] TlsAlloc failed[%lu].\n", ::GetLastError());
+        tls_dat->clear_self();
+        return invalid_value;
+    }
+    return reinterpret_cast<key_t>(tls_dat);
 }
 
-void release(key_t key) {
-    auto rec = tls_data::records();
-    if (rec == nullptr) return;
-    rec->erase(key);
-    ::TlsFree(static_cast<DWORD>(key));
+void release(key_t tls_key) {
+    if (tls_key == invalid_value) {
+        ipc::error("[tls::release] tls_key is invalid_value.\n");
+        return;
+    }
+    auto tls_dat = reinterpret_cast<tls_data*>(tls_key);
+    if (tls_dat == nullptr) {
+        ipc::error("[tls::release] tls_dat is nullptr.\n");
+        return;
+    }
+    erase_record(tls_dat);
 }
 
-bool set(key_t key, void* ptr) {
-    return ::TlsSetValue(static_cast<DWORD>(key),
-                         static_cast<LPVOID>(ptr)) == TRUE;
+bool set(key_t tls_key, void* ptr) {
+    if (tls_key == invalid_value) {
+        ipc::error("[tls::set] tls_key is invalid_value.\n");
+        return false;
+    }
+    auto tls_dat = reinterpret_cast<tls_data*>(tls_key);
+    if (tls_dat == nullptr) {
+        ipc::error("[tls::set] tls_dat is nullptr.\n");
+        return false;
+    }
+    if (!tls_dat->set(ptr)) {
+        ipc::error("[tls::set] TlsSetValue failed[%lu].\n", ::GetLastError());
+        return false;
+    }
+    record(tls_dat);
+    return true;
 }
 
-void* get(key_t key) {
-    return static_cast<void*>(::TlsGetValue(static_cast<DWORD>(key)));
+void* get(key_t tls_key) {
+    if (tls_key == invalid_value) {
+        ipc::error("[tls::get] tls_key is invalid_value.\n");
+        return nullptr;
+    }
+    auto tls_dat = reinterpret_cast<tls_data*>(tls_key);
+    if (tls_dat == nullptr) {
+        ipc::error("[tls::get] tls_dat is nullptr.\n");
+        return nullptr;
+    }
+    return tls_dat->get();
 }
 
 } // namespace tls
 
 namespace {
 
-void OnThreadExit() {
-    auto rec = tls_data::records();
-    if (rec == nullptr) return;
-    delete rec;
-    tls_data::records(nullptr);
-}
-
 void NTAPI OnTlsCallback(PVOID, DWORD dwReason, PVOID) {
-    if (dwReason == DLL_THREAD_DETACH) OnThreadExit();
+    if (dwReason == DLL_THREAD_DETACH) clear_all_records();
 }
 
 } // internal-linkage

@@ -2,7 +2,7 @@
 
 #include <cstddef>
 #include <cstdint>
-#include <limits>
+#include <limits>       // std::numeric_limits
 #include <new>
 #include <utility>
 
@@ -28,8 +28,9 @@ using uint_t = typename uint<N>::type;
 enum : std::size_t {
     invalid_value   = (std::numeric_limits<std::size_t>::max)(),
     data_length     = 64,
-    small_msg_limit = data_length * 64 - 1, // 4095
-    default_timeut  = 100 // ms
+    large_msg_limit = data_length,
+    large_msg_cache = 32,
+    default_timeout = 100 // ms
 };
 
 enum class relat { // multiplicity of the relationship

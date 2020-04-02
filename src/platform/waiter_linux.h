@@ -3,9 +3,9 @@
 #include <pthread.h>
 #include <fcntl.h>
 #include <sys/stat.h>
+#include <sys/time.h>
 #include <semaphore.h>
 #include <errno.h>
-#include <time.h>
 
 #include <atomic>
 #include <tuple>
@@ -19,11 +19,17 @@
 namespace ipc {
 namespace detail {
 
-inline static void calc_wait_time(timespec& ts, std::size_t tm) {
-    ::clock_gettime(CLOCK_REALTIME, &ts);
-    ts.tv_nsec += tm * 1000000; // nanoseconds
-    ts.tv_sec  += ts.tv_nsec / 1000000000;
+inline static bool calc_wait_time(timespec& ts, std::size_t tm /*ms*/) {
+    timeval now;
+    int eno = ::gettimeofday(&now, NULL);
+    if (eno != 0) {
+        ipc::error("fail gettimeofday[%d]\n", eno);
+        return false;
+    }
+    ts.tv_nsec = (now.tv_usec + (tm % 1000) * 1000) * 1000;
+    ts.tv_sec  =  now.tv_sec  + (tm / 1000) + (ts.tv_nsec / 1000000000);
     ts.tv_nsec %= 1000000000;
+    return true;
 }
 
 #pragma push_macro("IPC_PTHREAD_FUNC_")
@@ -57,6 +63,10 @@ public:
             ipc::error("fail pthread_mutexattr_setpshared[%d]\n", eno);
             return false;
         }
+        if ((eno = ::pthread_mutexattr_setrobust(&mutex_attr, PTHREAD_MUTEX_ROBUST)) != 0) {
+            ipc::error("fail pthread_mutexattr_setrobust[%d]\n", eno);
+            return false;
+        }
         if ((eno = ::pthread_mutex_init(&mutex_, &mutex_attr)) != 0) {
             ipc::error("fail pthread_mutex_init[%d]\n", eno);
             return false;
@@ -69,7 +79,27 @@ public:
     }
 
     bool lock() {
-        IPC_PTHREAD_FUNC_(pthread_mutex_lock, &mutex_);
+        for (;;) {
+            int eno = ::pthread_mutex_lock(&mutex_);
+            switch (eno) {
+            case 0:
+                return true;
+            case EOWNERDEAD:
+                if (::pthread_mutex_consistent(&mutex_) == 0) {
+                    ::pthread_mutex_unlock(&mutex_);
+                    break;
+                }
+                IPC_FALLTHROUGH_;
+            case ENOTRECOVERABLE:
+                if (close() && open()) {
+                    break;
+                }
+                IPC_FALLTHROUGH_;
+            default:
+                ipc::error("fail pthread_mutex_lock[%d]\n", eno);
+                return false;
+            }
+        }
     }
 
     bool unlock() {
@@ -271,7 +301,7 @@ public:
         if (counter_ > 0) {
             ret = sem_helper::post(std::get<1>(h));
             -- counter_;
-            ret = ret && sem_helper::wait(std::get<2>(h), default_timeut);
+            ret = ret && sem_helper::wait(std::get<2>(h), default_timeout);
         }
         return ret;
     }
@@ -289,7 +319,7 @@ public:
             }
             do {
                 -- counter_;
-                ret = ret && sem_helper::wait(std::get<2>(h), default_timeut);
+                ret = ret && sem_helper::wait(std::get<2>(h), default_timeout);
             } while (counter_ > 0);
         }
         return ret;

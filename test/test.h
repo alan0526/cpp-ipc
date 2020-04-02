@@ -8,13 +8,14 @@
 #include <string>
 #include <memory>
 #include <mutex>
+#include <utility>
 
 #if defined(__GNUC__)
 #   include <cxxabi.h>  // abi::__cxa_demangle
 #endif/*__GNUC__*/
 
-#include "stopwatch.hpp"
-#include "spin_lock.hpp"
+#include "capo/stopwatch.hpp"
+#include "capo/spin_lock.hpp"
 
 class TestSuite : public QObject
 {
@@ -40,12 +41,11 @@ struct test_stopwatch {
         }
     }
 
-    template <int Factor>
-    void print_elapsed(int N, int M, int Loops) {
-        auto ts = sw_.elapsed<std::chrono::microseconds>();
+    template <int Factor, typename ToDur = std::chrono::microseconds>
+    void print_elapsed(int N, int M, int Loops, const char * unit = " us/d") {
+        auto ts = sw_.elapsed<ToDur>();
         std::cout << "[" << N << ":" << M << ", " << Loops << "] "
-                  << "performance: " << (ts / 1000.0) << " ms, "
-                  << (double(ts) / double(Factor ? (Loops * Factor) : (Loops * N))) << " us/d" << std::endl;
+                  << (double(ts) / double(Factor ? (Loops * Factor) : (Loops * N))) << unit << std::endl;
     }
 
     void print_elapsed(int N, int M, int Loops) {
@@ -107,7 +107,7 @@ void benchmark_prod_cons(T* cq) {
 //                    std::unique_lock<capo::spin_lock> guard { lc };
 //                    std::cout << cid << "-recving: " << (i * 100) / (Loops * N) << "%" << std::endl;
 //                }
-                vf.push_data(cid, msg);
+                vf.push_data(cid, std::forward<decltype(msg)>(msg));
                 ++i;
             });
 //            {
